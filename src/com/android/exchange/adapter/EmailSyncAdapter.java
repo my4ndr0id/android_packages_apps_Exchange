@@ -316,6 +316,17 @@ public class EmailSyncAdapter extends AbstractSyncAdapter {
             lookback = SyncWindow.SYNC_WINDOW_1_MONTH;
         }
 
+        // Limit lookback to policy limit
+        if (mAccount.mPolicyKey > 0) {
+            Policy policy = Policy.restorePolicyWithId(mContext, mAccount.mPolicyKey);
+            if (policy != null) {
+                int maxLookback = policy.mMaxEmailLookback;
+                if (maxLookback != 0 && (lookback > policy.mMaxEmailLookback)) {
+                    lookback = policy.mMaxEmailLookback;
+                }
+            }
+        }
+
         // Store the new lookback and persist it
         // TODO Code similar to this is used elsewhere (e.g. MailboxSettings); try to clean this up
         ContentValues cv = new ContentValues();
@@ -864,6 +875,9 @@ public class EmailSyncAdapter extends AbstractSyncAdapter {
             Cursor c = mContentResolver.query(Message.CONTENT_URI, projection,
                     WHERE_SERVER_ID_AND_MAILBOX_KEY, mBindArguments, null);
             if (c == null) throw new ProviderUnavailableException();
+            if (c.getCount() > 1) {
+                userLog("Multiple messages with the same serverId/mailbox: " + serverId);
+            }
             return c;
         }
 
@@ -1063,6 +1077,13 @@ public class EmailSyncAdapter extends AbstractSyncAdapter {
                 try {
                     if (c.moveToFirst()) {
                         id = c.getString(EmailContent.ID_PROJECTION_COLUMN);
+                        while (c.moveToNext()) {
+                            // This shouldn't happen, but clean up if it does
+                            Long dupId =
+                                    Long.parseLong(c.getString(EmailContent.ID_PROJECTION_COLUMN));
+                            userLog("Delete duplicate with id: " + dupId);
+                            deletedEmails.add(dupId);
+                        }
                     }
                 } finally {
                     c.close();
@@ -1333,7 +1354,23 @@ public class EmailSyncAdapter extends AbstractSyncAdapter {
                     boolean readChange = false;
 
                     long mailbox = currentCursor.getLong(UPDATES_MAILBOX_KEY_COLUMN);
-                    if (mailbox != c.getLong(Message.LIST_MAILBOX_KEY_COLUMN)) {
+                    // If the message is now in the trash folder, it has been deleted by the user
+                    if (mailbox == trashMailboxId) {
+                         if (firstCommand) {
+                            s.start(Tags.SYNC_COMMANDS);
+                            firstCommand = false;
+                        }
+                        // Send the command to delete this message
+                        s.start(Tags.SYNC_DELETE).data(Tags.SYNC_SERVER_ID, serverId).end();
+                        // Mark the message as moved (so the copy will be deleted if/when the server
+                        // version is synced)
+                        int flags = c.getInt(Message.LIST_FLAGS_COLUMN);
+                        cv.put(MessageColumns.FLAGS,
+                                flags | EasSyncService.MESSAGE_FLAG_MOVED_MESSAGE);
+                        cr.update(ContentUris.withAppendedId(Message.CONTENT_URI, id), cv,
+                                null, null);
+                        continue;
+                    } else if (mailbox != c.getLong(Message.LIST_MAILBOX_KEY_COLUMN)) {
                         // The message has moved to another mailbox; add a request for this
                         // Note: The Sync command doesn't handle moving messages, so we need
                         // to handle this as a "request" (similar to meeting response and
@@ -1406,24 +1443,6 @@ public class EmailSyncAdapter extends AbstractSyncAdapter {
                         }
                     }
                     s.end().end(); // SYNC_APPLICATION_DATA, SYNC_CHANGE
-
-                    // If the message is now in the trash folder, it has been deleted by the user
-                    if (currentCursor.getLong(UPDATES_MAILBOX_KEY_COLUMN) == trashMailboxId) {
-                         if (firstCommand) {
-                            s.start(Tags.SYNC_COMMANDS);
-                            firstCommand = false;
-                        }
-                        // Send the command to delete this message
-                        s.start(Tags.SYNC_DELETE).data(Tags.SYNC_SERVER_ID, serverId).end();
-                        // Mark the message as moved (so the copy will be deleted if/when the server
-                        // version is synced)
-                        int flags = c.getInt(Message.LIST_FLAGS_COLUMN);
-                        cv.put(MessageColumns.FLAGS,
-                                flags | EasSyncService.MESSAGE_FLAG_MOVED_MESSAGE);
-                        cr.update(ContentUris.withAppendedId(Message.CONTENT_URI, id), cv,
-                                null, null);
-                        continue;
-                    }
                 } finally {
                     currentCursor.close();
                 }
